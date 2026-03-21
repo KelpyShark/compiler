@@ -1,0 +1,8 @@
+[package]
+name = "kelpyshark-compiler"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+
+[dev-dependencies]
