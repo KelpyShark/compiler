@@ -21,6 +21,7 @@ pub enum TokenKind {
     // ── Keywords ──
     Def,
     If,
+    Elif,
     Else,
     While,
     For,
@@ -33,6 +34,15 @@ pub enum TokenKind {
     Or,
     Not,
     Print,
+    Break,
+    Continue,
+    Try,
+    Catch,
+    Throw,
+    Class,
+    Null,
+    New,
+    Self_,
 
     // ── Operators ──
     Plus,         // +
@@ -47,6 +57,10 @@ pub enum TokenKind {
     LessEqual,    // <=
     GreaterThan,  // >
     GreaterEqual, // >=
+    PlusEquals,   // +=
+    MinusEquals,  // -=
+    StarEquals,   // *=
+    SlashEquals,  // /=
 
     // ── Punctuation ──
     LParen,   // (
@@ -73,6 +87,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::BooleanLiteral(b) => write!(f, "BOOL({})", b),
             TokenKind::Def => write!(f, "DEF"),
             TokenKind::If => write!(f, "IF"),
+            TokenKind::Elif => write!(f, "ELIF"),
             TokenKind::Else => write!(f, "ELSE"),
             TokenKind::While => write!(f, "WHILE"),
             TokenKind::For => write!(f, "FOR"),
@@ -85,6 +100,15 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Or => write!(f, "OR"),
             TokenKind::Not => write!(f, "NOT"),
             TokenKind::Print => write!(f, "PRINT"),
+            TokenKind::Break => write!(f, "BREAK"),
+            TokenKind::Continue => write!(f, "CONTINUE"),
+            TokenKind::Try => write!(f, "TRY"),
+            TokenKind::Catch => write!(f, "CATCH"),
+            TokenKind::Throw => write!(f, "THROW"),
+            TokenKind::Class => write!(f, "CLASS"),
+            TokenKind::Null => write!(f, "NULL"),
+            TokenKind::New => write!(f, "NEW"),
+            TokenKind::Self_ => write!(f, "SELF"),
             TokenKind::Plus => write!(f, "+"),
             TokenKind::Minus => write!(f, "-"),
             TokenKind::Star => write!(f, "*"),
@@ -97,6 +121,10 @@ impl std::fmt::Display for TokenKind {
             TokenKind::LessEqual => write!(f, "<="),
             TokenKind::GreaterThan => write!(f, ">"),
             TokenKind::GreaterEqual => write!(f, ">="),
+            TokenKind::PlusEquals => write!(f, "+="),
+            TokenKind::MinusEquals => write!(f, "-="),
+            TokenKind::StarEquals => write!(f, "*="),
+            TokenKind::SlashEquals => write!(f, "/="),
             TokenKind::LParen => write!(f, "("),
             TokenKind::RParen => write!(f, ")"),
             TokenKind::LBrace => write!(f, "{{"),
@@ -439,6 +467,7 @@ impl Lexer {
         let kind = match ident.as_str() {
             "def" => TokenKind::Def,
             "if" => TokenKind::If,
+            "elif" => TokenKind::Elif,
             "else" => TokenKind::Else,
             "while" => TokenKind::While,
             "for" => TokenKind::For,
@@ -451,6 +480,15 @@ impl Lexer {
             "or" => TokenKind::Or,
             "not" => TokenKind::Not,
             "print" => TokenKind::Print,
+            "break" => TokenKind::Break,
+            "continue" => TokenKind::Continue,
+            "try" => TokenKind::Try,
+            "catch" => TokenKind::Catch,
+            "throw" => TokenKind::Throw,
+            "class" => TokenKind::Class,
+            "null" => TokenKind::Null,
+            "new" => TokenKind::New,
+            "self" => TokenKind::Self_,
             _ => TokenKind::Identifier(ident),
         };
 
@@ -467,10 +505,38 @@ impl Lexer {
         let ch = self.advance().unwrap();
 
         let kind = match ch {
-            '+' => TokenKind::Plus,
-            '-' => TokenKind::Minus,
-            '*' => TokenKind::Star,
-            '/' => TokenKind::Slash,
+            '+' => {
+                if self.peek() == Some('=') {
+                    self.advance();
+                    TokenKind::PlusEquals
+                } else {
+                    TokenKind::Plus
+                }
+            }
+            '-' => {
+                if self.peek() == Some('=') {
+                    self.advance();
+                    TokenKind::MinusEquals
+                } else {
+                    TokenKind::Minus
+                }
+            }
+            '*' => {
+                if self.peek() == Some('=') {
+                    self.advance();
+                    TokenKind::StarEquals
+                } else {
+                    TokenKind::Star
+                }
+            }
+            '/' => {
+                if self.peek() == Some('=') {
+                    self.advance();
+                    TokenKind::SlashEquals
+                } else {
+                    TokenKind::Slash
+                }
+            }
             '%' => TokenKind::Percent,
             '(' => TokenKind::LParen,
             ')' => TokenKind::RParen,

@@ -143,6 +143,41 @@ impl JsGenerator {
                     alias, path
                 ));
             }
+            Statement::Break { .. } => self.line("break;"),
+            Statement::Continue { .. } => self.line("continue;"),
+            Statement::Throw { value, .. } => {
+                let v = self.emit_expr(value);
+                self.line(&format!("throw {};", v));
+            }
+            Statement::TryCatch { try_body, catch_var, catch_body, .. } => {
+                self.line("try {");
+                self.indent += 1;
+                for s in try_body { self.emit_statement(s); }
+                self.indent -= 1;
+                let var = catch_var.as_str();
+                self.line(&format!("}} catch ({}) {{", var));
+                self.indent += 1;
+                for s in catch_body { self.emit_statement(s); }
+                self.indent -= 1;
+                self.line("}");
+            }
+            Statement::CompoundAssignment { name, op, value, .. } => {
+                let v = self.emit_expr(value);
+                let js_op = match op {
+                    CompoundOp::Add => "+=",
+                    CompoundOp::Subtract => "-=",
+                    CompoundOp::Multiply => "*=",
+                    CompoundOp::Divide => "/=",
+                };
+                self.line(&format!("{} {} {};", name, js_op, v));
+            }
+            Statement::ClassDef { name, methods, .. } => {
+                self.line(&format!("class {} {{", name));
+                self.indent += 1;
+                for m in methods { self.emit_statement(m); }
+                self.indent -= 1;
+                self.line("}");
+            }
         }
     }
 
@@ -235,6 +270,16 @@ impl JsGenerator {
                 }
                 result.push('`');
                 result
+            }
+            Expr::NullLiteral { .. } => "null".to_string(),
+            Expr::MethodCall { object, method, args, .. } => {
+                let obj = self.emit_expr(object);
+                let arg_strs: Vec<String> = args.iter().map(|a| self.emit_expr(a)).collect();
+                format!("{}.{}({})", obj, method, arg_strs.join(", "))
+            }
+            Expr::New { class_name, args, .. } => {
+                let arg_strs: Vec<String> = args.iter().map(|a| self.emit_expr(a)).collect();
+                format!("new {}({})", class_name, arg_strs.join(", "))
             }
         }
     }

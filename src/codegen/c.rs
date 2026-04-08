@@ -281,6 +281,18 @@ impl CGenerator {
             Statement::For { .. } => {
                 self.line("/* TODO: for loop C codegen */");
             }
+            // New statements — stub out for now
+            Statement::Break { .. } => self.line("break;"),
+            Statement::Continue { .. } => self.line("continue;"),
+            Statement::Throw { value, .. } => {
+                let v = self.emit_expr(value);
+                self.line(&format!("ks_throw({});", v));
+            }
+            Statement::TryCatch { .. }
+            | Statement::CompoundAssignment { .. }
+            | Statement::ClassDef { .. } => {
+                self.line("/* TODO: codegen for this statement */");
+            }
         }
     }
 
@@ -366,6 +378,9 @@ impl CGenerator {
             Expr::MemberAccess { .. } => "/* TODO: member access */ks_null()".to_string(),
             Expr::ListLiteral { .. } => "/* TODO: list literal */ks_null()".to_string(),
             Expr::DictLiteral { .. } => "/* TODO: dict literal */ks_null()".to_string(),
+            Expr::NullLiteral { .. } => "ks_null()".to_string(),
+            Expr::MethodCall { .. } => "/* TODO: method call */ks_null()".to_string(),
+            Expr::New { .. } => "/* TODO: new expression */ks_null()".to_string(),
         }
     }
 }

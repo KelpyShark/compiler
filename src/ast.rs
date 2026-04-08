@@ -19,6 +19,13 @@ pub enum Statement {
         value: Expr,
         location: SourceLocation,
     },
+    /// Compound assignment: `x += expr`, `x -= expr`, etc.
+    CompoundAssignment {
+        name: String,
+        op: CompoundOp,
+        value: Expr,
+        location: SourceLocation,
+    },
     /// Function definition: `def name(params) { body }`
     FunctionDef {
         name: String,
@@ -26,7 +33,7 @@ pub enum Statement {
         body: Vec<Statement>,
         location: SourceLocation,
     },
-    /// If statement: `if expr { body }` with optional else
+    /// If statement: `if expr { body }` with optional elif/else
     If {
         condition: Expr,
         then_body: Vec<Statement>,
@@ -51,6 +58,14 @@ pub enum Statement {
         value: Option<Expr>,
         location: SourceLocation,
     },
+    /// Break statement: `break`
+    Break {
+        location: SourceLocation,
+    },
+    /// Continue statement: `continue`
+    Continue {
+        location: SourceLocation,
+    },
     /// Import statement: `import module_name`
     Import {
         module: String,
@@ -59,6 +74,24 @@ pub enum Statement {
     /// Print statement: `print expr`
     Print {
         value: Expr,
+        location: SourceLocation,
+    },
+    /// Try-catch block: `try { body } catch (err) { handler }`
+    TryCatch {
+        try_body: Vec<Statement>,
+        catch_var: String,
+        catch_body: Vec<Statement>,
+        location: SourceLocation,
+    },
+    /// Throw statement: `throw expr`
+    Throw {
+        value: Expr,
+        location: SourceLocation,
+    },
+    /// Class definition: `class Name { def method(self) { ... } }`
+    ClassDef {
+        name: String,
+        methods: Vec<Statement>,
         location: SourceLocation,
     },
     /// Expression used as a statement (e.g. a function call).
@@ -132,6 +165,23 @@ pub enum Expr {
         entries: Vec<(Expr, Expr)>,
         location: SourceLocation,
     },
+    /// Null literal: `null`
+    NullLiteral {
+        location: SourceLocation,
+    },
+    /// Method call: `obj.method(args)` — distinct from MemberAccess + FunctionCall
+    MethodCall {
+        object: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+        location: SourceLocation,
+    },
+    /// Object instantiation: `new ClassName(args)`
+    New {
+        class_name: String,
+        args: Vec<Expr>,
+        location: SourceLocation,
+    },
     /// String interpolation: `"Hello {$name}!"`
     /// Stored as a list of parts — either literal strings or expressions.
     StringInterpolation {
@@ -199,4 +249,13 @@ impl std::fmt::Display for UnaryOperator {
             UnaryOperator::Not => write!(f, "not"),
         }
     }
+}
+
+/// Compound assignment operators.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompoundOp {
+    Add,      // +=
+    Subtract, // -=
+    Multiply, // *=
+    Divide,   // /=
 }

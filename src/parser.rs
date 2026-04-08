@@ -127,12 +127,25 @@ impl Parser {
         self.skip_newlines();
         match self.peek().clone() {
             TokenKind::Def => self.parse_function_def(),
+            TokenKind::Class => self.parse_class_def(),
             TokenKind::If => self.parse_if(),
             TokenKind::While => self.parse_while(),
             TokenKind::For => self.parse_for(),
             TokenKind::Return => self.parse_return(),
+            TokenKind::Break => {
+                let loc = self.current_location();
+                self.advance();
+                Ok(Statement::Break { location: loc })
+            }
+            TokenKind::Continue => {
+                let loc = self.current_location();
+                self.advance();
+                Ok(Statement::Continue { location: loc })
+            }
             TokenKind::Import => self.parse_import(),
             TokenKind::Print => self.parse_print(),
+            TokenKind::Try => self.parse_try_catch(),
+            TokenKind::Throw => self.parse_throw(),
             _ => self.parse_assignment_or_expr(),
         }
     }
@@ -205,13 +218,17 @@ impl Parser {
 
     fn parse_if(&mut self) -> KelpyResult<Statement> {
         let location = self.current_location();
-        self.advance(); // consume `if`
+        self.advance(); // consume `if` or `elif`
 
         let condition = self.parse_expression(Precedence::None)?;
         let then_body = self.parse_block()?;
 
         self.skip_newlines();
-        let else_body = if matches!(self.peek(), TokenKind::Else) {
+        let else_body = if matches!(self.peek(), TokenKind::Elif) {
+            // elif is parsed as another if in the else branch
+            let elif = self.parse_if()?;
+            Some(vec![elif])
+        } else if matches!(self.peek(), TokenKind::Else) {
             self.advance();
             if matches!(self.peek(), TokenKind::If) {
                 // else if ...
@@ -321,6 +338,64 @@ impl Parser {
         Ok(Statement::Print { value, location })
     }
 
+    fn parse_try_catch(&mut self) -> KelpyResult<Statement> {
+        let location = self.current_location();
+        self.advance(); // consume `try`
+        let try_body = self.parse_block()?;
+        self.skip_newlines();
+        self.expect(&TokenKind::Catch)?;
+        self.expect(&TokenKind::LParen)?;
+        let catch_var = match self.peek().clone() {
+            TokenKind::Identifier(name) => {
+                self.advance();
+                name
+            }
+            _ => return Err(self.error("Expected variable name in catch()")),
+        };
+        self.expect(&TokenKind::RParen)?;
+        let catch_body = self.parse_block()?;
+        Ok(Statement::TryCatch {
+            try_body,
+            catch_var,
+            catch_body,
+            location,
+        })
+    }
+
+    fn parse_throw(&mut self) -> KelpyResult<Statement> {
+        let location = self.current_location();
+        self.advance(); // consume `throw`
+        let value = self.parse_expression(Precedence::None)?;
+        Ok(Statement::Throw { value, location })
+    }
+
+    fn parse_class_def(&mut self) -> KelpyResult<Statement> {
+        let location = self.current_location();
+        self.advance(); // consume `class`
+        let name = match self.peek().clone() {
+            TokenKind::Identifier(n) => {
+                self.advance();
+                n
+            }
+            _ => return Err(self.error("Expected class name after 'class'")),
+        };
+        self.skip_newlines();
+        self.expect(&TokenKind::LBrace)?;
+        self.skip_newlines();
+        let mut methods = Vec::new();
+        while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+            let method = self.parse_function_def()?;
+            methods.push(method);
+            self.skip_newlines();
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Statement::ClassDef {
+            name,
+            methods,
+            location,
+        })
+    }
+
     fn parse_assignment_or_expr(&mut self) -> KelpyResult<Statement> {
         let location = self.current_location();
         let expr = self.parse_expression(Precedence::None)?;
@@ -338,6 +413,32 @@ impl Parser {
             } else {
                 return Err(KelpyError::ParseError {
                     message: "Invalid assignment target".to_string(),
+                    location,
+                });
+            }
+        }
+
+        // Compound assignment: `name += expr`, etc.
+        let compound_op = match self.peek() {
+            TokenKind::PlusEquals => Some(CompoundOp::Add),
+            TokenKind::MinusEquals => Some(CompoundOp::Subtract),
+            TokenKind::StarEquals => Some(CompoundOp::Multiply),
+            TokenKind::SlashEquals => Some(CompoundOp::Divide),
+            _ => None,
+        };
+        if let Some(op) = compound_op {
+            self.advance(); // consume the compound op
+            if let Expr::Identifier { name, .. } = expr {
+                let value = self.parse_expression(Precedence::None)?;
+                return Ok(Statement::CompoundAssignment {
+                    name,
+                    op,
+                    value,
+                    location,
+                });
+            } else {
+                return Err(KelpyError::ParseError {
+                    message: "Invalid compound assignment target".to_string(),
                     location,
                 });
             }
@@ -410,6 +511,38 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Identifier {
                     name,
+                    location: loc,
+                })
+            }
+            TokenKind::Self_ => {
+                let loc = self.current_location();
+                self.advance();
+                Ok(Expr::Identifier {
+                    name: "self".to_string(),
+                    location: loc,
+                })
+            }
+            TokenKind::Null => {
+                let loc = self.current_location();
+                self.advance();
+                Ok(Expr::NullLiteral { location: loc })
+            }
+            TokenKind::New => {
+                let loc = self.current_location();
+                self.advance();
+                let class_name = match self.peek().clone() {
+                    TokenKind::Identifier(n) => {
+                        self.advance();
+                        n
+                    }
+                    _ => return Err(self.error("Expected class name after 'new'")),
+                };
+                self.expect(&TokenKind::LParen)?;
+                let args = self.parse_arg_list()?;
+                self.expect(&TokenKind::RParen)?;
+                Ok(Expr::New {
+                    class_name,
+                    args,
                     location: loc,
                 })
             }
@@ -499,18 +632,31 @@ impl Parser {
                     location: loc,
                 })
             }
-            // Member access
+            // Member access or method call
             TokenKind::Dot => {
                 let loc = self.current_location();
                 self.advance(); // consume .
                 match self.peek().clone() {
                     TokenKind::Identifier(member) => {
                         self.advance();
-                        Ok(Expr::MemberAccess {
-                            object: Box::new(left),
-                            member,
-                            location: loc,
-                        })
+                        // If followed by `(`, it's a method call
+                        if matches!(self.peek(), TokenKind::LParen) {
+                            self.advance(); // consume (
+                            let args = self.parse_arg_list()?;
+                            self.expect(&TokenKind::RParen)?;
+                            Ok(Expr::MethodCall {
+                                object: Box::new(left),
+                                method: member,
+                                args,
+                                location: loc,
+                            })
+                        } else {
+                            Ok(Expr::MemberAccess {
+                                object: Box::new(left),
+                                member,
+                                location: loc,
+                            })
+                        }
                     }
                     _ => Err(self.error("Expected member name after '.'")),
                 }

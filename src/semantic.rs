@@ -304,6 +304,21 @@ impl SemanticAnalyzer {
             Statement::ExprStatement { expr, .. } => {
                 self.analyze_expr(expr);
             }
+            // New statement types — basic analysis (walk inner expressions)
+            Statement::CompoundAssignment { value, .. } => {
+                self.analyze_expr(value);
+            }
+            Statement::Break { .. } | Statement::Continue { .. } => {}
+            Statement::Throw { value, .. } => {
+                self.analyze_expr(value);
+            }
+            Statement::TryCatch { try_body, catch_body, .. } => {
+                for s in try_body { self.analyze_statement(s); }
+                for s in catch_body { self.analyze_statement(s); }
+            }
+            Statement::ClassDef { methods, .. } => {
+                for m in methods { self.analyze_statement(m); }
+            }
         }
     }
 
@@ -398,6 +413,17 @@ impl SemanticAnalyzer {
                         self.analyze_expr(expr);
                     }
                 }
+            }
+
+            Expr::NullLiteral { .. } => {}
+
+            Expr::MethodCall { object, args, .. } => {
+                self.analyze_expr(object);
+                for arg in args { self.analyze_expr(arg); }
+            }
+
+            Expr::New { args, .. } => {
+                for arg in args { self.analyze_expr(arg); }
             }
         }
     }
