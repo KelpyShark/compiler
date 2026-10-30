@@ -19,6 +19,20 @@ pub enum Statement {
         value: Expr,
         location: SourceLocation,
     },
+    /// Assignment to a member: `object.field = expr`.
+    MemberAssignment {
+        object: Expr,
+        member: String,
+        value: Expr,
+        location: SourceLocation,
+    },
+    /// Assignment to an indexed value: `object[index] = expr`.
+    IndexAssignment {
+        object: Expr,
+        index: Expr,
+        value: Expr,
+        location: SourceLocation,
+    },
     /// Compound assignment: `x += expr`, `x -= expr`, etc.
     CompoundAssignment {
         name: String,

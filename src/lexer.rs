@@ -43,6 +43,7 @@ pub enum TokenKind {
     Null,
     New,
     Self_,
+    End,
 
     // ── Operators ──
     Plus,         // +
@@ -109,6 +110,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Null => write!(f, "NULL"),
             TokenKind::New => write!(f, "NEW"),
             TokenKind::Self_ => write!(f, "SELF"),
+            TokenKind::End => write!(f, "END"),
             TokenKind::Plus => write!(f, "+"),
             TokenKind::Minus => write!(f, "-"),
             TokenKind::Star => write!(f, "*"),
@@ -489,6 +491,7 @@ impl Lexer {
             "null" => TokenKind::Null,
             "new" => TokenKind::New,
             "self" => TokenKind::Self_,
+            "end" => TokenKind::End,
             _ => TokenKind::Identifier(ident),
         };
 
@@ -652,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let kinds = token_kinds("def if else while for in return import true false and or not print");
+        let kinds = token_kinds("def if else while for in return import true false and or not print end");
         assert_eq!(
             kinds,
             vec![
@@ -670,6 +673,7 @@ mod tests {
                 TokenKind::Or,
                 TokenKind::Not,
                 TokenKind::Print,
+                TokenKind::End,
                 TokenKind::Eof,
             ]
         );

@@ -1,1 +1,10 @@
-/target
+# Cargo build output
+/target/
+
+# Local notes and temporary files
+/.notes/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

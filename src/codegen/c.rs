@@ -9,12 +9,26 @@
 ///   - Statements map to C statements; expressions map to C expressions.
 
 use crate::ast::*;
+use std::collections::HashSet;
 
-/// Generate a complete C source file from a KelpyShark Program AST.
-pub fn generate(program: &Program) -> String {
+/// Generate C source after validating that the target supports the program.
+pub fn generate(program: &Program) -> Result<String, String> {
+    generate_checked(program)
+}
+
+/// Generate a C source file without checking whether every construct is supported.
+/// Prefer [`generate`] or [`generate_checked`] for user-provided programs.
+fn generate_unchecked(program: &Program) -> String {
     let mut gen = CGenerator::new();
     gen.emit_program(program);
     gen.output
+}
+
+/// Generate C only for constructs implemented by this backend. This keeps the
+/// CLI from emitting plausible-looking source containing TODO placeholders.
+pub fn generate_checked(program: &Program) -> Result<String, String> {
+    validate_c_program(program)?;
+    Ok(generate_unchecked(program))
 }
 
 struct CGenerator {
@@ -69,6 +83,8 @@ impl CGenerator {
         // Emit main
         self.line("int main(void) {");
         self.indent += 1;
+        let top_level: Vec<_> = program.statements.iter().filter(|stmt| !matches!(stmt, Statement::FunctionDef { .. })).cloned().collect();
+        emit_variable_declarations(self, &top_level, &HashSet::new());
 
         for stmt in &program.statements {
             if let Statement::FunctionDef { .. } = stmt {
@@ -107,7 +123,8 @@ impl CGenerator {
         self.blank();
         // Constructor helpers
         self.line("static KsValue ks_num(double n) { KsValue v; v.type = KS_NUMBER; v.data.number = n; return v; }");
-        self.line("static KsValue ks_str(const char* s) { KsValue v; v.type = KS_STRING; v.data.string = strdup(s); return v; }");
+        self.line("static char* ks_dup(const char* s) { size_t n = strlen(s) + 1; char* copy = malloc(n); if (copy) memcpy(copy, s, n); return copy; }");
+        self.line("static KsValue ks_str(const char* s) { KsValue v; v.type = KS_STRING; v.data.string = ks_dup(s); return v; }");
         self.line("static KsValue ks_bool(int b) { KsValue v; v.type = KS_BOOL; v.data.boolean = b; return v; }");
         self.line("static KsValue ks_null(void) { KsValue v; v.type = KS_NULL; v.data.number = 0; return v; }");
         self.blank();
@@ -199,7 +216,7 @@ impl CGenerator {
         match stmt {
             Statement::Assignment { name, value, .. } => {
                 let expr = self.emit_expr(value);
-                self.line(&format!("KsValue {} = {};", name, expr));
+                self.line(&format!("{} = {};", variable_name(name), expr));
             }
             Statement::FunctionDef {
                 name,
@@ -209,7 +226,7 @@ impl CGenerator {
             } => {
                 let param_list: Vec<String> = params
                     .iter()
-                    .map(|p| format!("KsValue {}", p))
+                    .map(|p| format!("KsValue {}", variable_name(p)))
                     .collect();
                 self.line(&format!(
                     "KsValue ks_{}({}) {{",
@@ -217,6 +234,8 @@ impl CGenerator {
                     param_list.join(", ")
                 ));
                 self.indent += 1;
+                let parameters = params.iter().cloned().collect();
+                emit_variable_declarations(self, body, &parameters);
                 for s in body {
                     self.emit_statement(s);
                 }
@@ -290,6 +309,8 @@ impl CGenerator {
             }
             Statement::TryCatch { .. }
             | Statement::CompoundAssignment { .. }
+            | Statement::MemberAssignment { .. }
+            | Statement::IndexAssignment { .. }
             | Statement::ClassDef { .. } => {
                 self.line("/* TODO: codegen for this statement */");
             }
@@ -308,12 +329,12 @@ impl CGenerator {
                 }
             }
             Expr::StringLiteral { value, .. } => {
-                format!("ks_str(\"{}\")", value.replace('\\', "\\\\").replace('"', "\\\""))
+                format!("ks_str({})", quote_c_string(value))
             }
             Expr::BooleanLiteral { value, .. } => {
                 format!("ks_bool({})", if *value { 1 } else { 0 })
             }
-            Expr::Identifier { name, .. } => name.clone(),
+            Expr::Identifier { name, .. } => variable_name(name),
             Expr::BinaryOp {
                 left, op, right, ..
             } => {
@@ -360,11 +381,7 @@ impl CGenerator {
                 for part in parts {
                     match part {
                         StringPart::Literal(s) => {
-                            result = format!(
-                                "ks_add({}, ks_str(\"{}\"))",
-                                result,
-                                s.replace('\\', "\\\\").replace('"', "\\\"")
-                            );
+                            result = format!("ks_add({}, ks_str({}))", result, quote_c_string(s));
                         }
                         StringPart::Expression(expr) => {
                             let e = self.emit_expr(expr);
@@ -385,6 +402,124 @@ impl CGenerator {
     }
 }
 
+fn emit_variable_declarations(
+    generator: &mut CGenerator,
+    statements: &[Statement],
+    parameters: &HashSet<String>,
+) {
+    fn collect(statements: &[Statement], names: &mut HashSet<String>) {
+        for statement in statements {
+            match statement {
+                Statement::Assignment { name, .. } => { names.insert(name.clone()); }
+                Statement::If { then_body, else_body, .. } => {
+                    collect(then_body, names);
+                    if let Some(body) = else_body { collect(body, names); }
+                }
+                Statement::While { body, .. } => collect(body, names),
+                Statement::FunctionDef { .. } | Statement::ClassDef { .. } => {}
+                _ => {}
+            }
+        }
+    }
+
+    let mut names = HashSet::new();
+    collect(statements, &mut names);
+    let mut names: Vec<_> = names.into_iter().filter(|name| !parameters.contains(name)).collect();
+    names.sort();
+    for name in names {
+        generator.line(&format!("KsValue {} = ks_null();", variable_name(&name)));
+    }
+}
+
+fn variable_name(name: &str) -> String { format!("ksv_{}", name) }
+
+fn validate_c_program(program: &Program) -> Result<(), String> {
+    let functions: HashSet<String> = program.statements.iter().filter_map(|statement| {
+        if let Statement::FunctionDef { name, .. } = statement { Some(name.clone()) } else { None }
+    }).collect();
+    validate_c_statements(&program.statements, &functions, true)
+}
+
+fn validate_c_statements(statements: &[Statement], functions: &HashSet<String>, top_level: bool) -> Result<(), String> {
+    for statement in statements {
+        match statement {
+            Statement::Assignment { value, .. } | Statement::Print { value, .. } | Statement::Throw { value, .. } => {
+                if matches!(statement, Statement::Throw { .. }) { return Err("C target does not support throw statements".to_string()); }
+                validate_c_expr(value, functions)?;
+            }
+            Statement::MemberAssignment { .. } | Statement::IndexAssignment { .. } => {
+                return Err("C target does not support member or index assignment".to_string());
+            }
+            Statement::CompoundAssignment { .. } => return Err("C target does not support compound assignment".to_string()),
+            Statement::FunctionDef { body, .. } => {
+                if !top_level { return Err("C target does not support nested function definitions".to_string()); }
+                validate_c_statements(body, functions, false)?;
+            }
+            Statement::If { condition, then_body, else_body, .. } => {
+                validate_c_expr(condition, functions)?;
+                validate_c_statements(then_body, functions, false)?;
+                if let Some(body) = else_body { validate_c_statements(body, functions, false)?; }
+            }
+            Statement::While { condition, body, .. } => {
+                validate_c_expr(condition, functions)?;
+                validate_c_statements(body, functions, false)?;
+            }
+            Statement::For { .. } => return Err("C target does not support for loops".to_string()),
+            Statement::Return { value, .. } => if let Some(value) = value { validate_c_expr(value, functions)?; },
+            Statement::Break { .. } | Statement::Continue { .. } => {}
+            Statement::Import { .. } => return Err("C target does not support imports".to_string()),
+            Statement::TryCatch { .. } => return Err("C target does not support try/catch".to_string()),
+            Statement::ClassDef { .. } => return Err("C target does not support classes".to_string()),
+            Statement::ExprStatement { expr, .. } => validate_c_expr(expr, functions)?,
+        }
+    }
+    Ok(())
+}
+
+fn validate_c_expr(expr: &Expr, functions: &HashSet<String>) -> Result<(), String> {
+    match expr {
+        Expr::NumberLiteral { value, .. } if !value.is_finite() => return Err("C target does not support non-finite number literals".to_string()),
+        Expr::NumberLiteral { .. } | Expr::StringLiteral { .. } | Expr::BooleanLiteral { .. }
+        | Expr::Identifier { .. } | Expr::NullLiteral { .. } => {}
+        Expr::BinaryOp { left, right, .. } => { validate_c_expr(left, functions)?; validate_c_expr(right, functions)?; }
+        Expr::UnaryOp { operand, .. } => validate_c_expr(operand, functions)?,
+        Expr::FunctionCall { callee, args, .. } => {
+            let Expr::Identifier { name, .. } = callee.as_ref() else {
+                return Err("C target only supports calls to top-level user functions".to_string());
+            };
+            if !functions.contains(name) { return Err(format!("C target does not support call to '{}'", name)); }
+            for arg in args { validate_c_expr(arg, functions)?; }
+        }
+        Expr::StringInterpolation { parts, .. } => for part in parts {
+            if let StringPart::Expression(value) = part { validate_c_expr(value, functions)?; }
+        },
+        Expr::Index { .. } | Expr::MemberAccess { .. } | Expr::ListLiteral { .. }
+        | Expr::DictLiteral { .. } | Expr::MethodCall { .. } | Expr::New { .. } => {
+            return Err("C target does not support collections, member/index access, or object construction".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn quote_c_string(value: &str) -> String {
+    let mut result = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            '\u{0008}' => result.push_str("\\b"),
+            '\u{000c}' => result.push_str("\\f"),
+            ch if ch.is_control() => result.push_str(&format!("\\{:03o}", ch as u32)),
+            ch => result.push(ch),
+        }
+    }
+    result.push('"');
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,7 +531,7 @@ mod tests {
         let tokens = lexer.tokenize().unwrap();
         let mut parser = Parser::new(tokens);
         let program = parser.parse().unwrap();
-        generate(&program)
+        generate(&program).unwrap()
     }
 
     #[test]
@@ -409,20 +544,30 @@ mod tests {
     #[test]
     fn test_c_assignment() {
         let c = gen_c("x = 42");
-        assert!(c.contains("KsValue x = ks_num(42.0)"));
+        assert!(c.contains("KsValue ksv_x = ks_null();\n    ksv_x = ks_num(42.0);"));
     }
 
     #[test]
     fn test_c_function_def() {
         let c = gen_c("def add(a, b) {\n  return a + b\n}");
-        assert!(c.contains("KsValue ks_add(KsValue a, KsValue b)"));
-        assert!(c.contains("return ks_add(a, b)"));
+        assert!(c.contains("KsValue ks_add(KsValue ksv_a, KsValue ksv_b)"));
+        assert!(c.contains("return ks_add(ksv_a, ksv_b)"));
     }
 
     #[test]
     fn test_c_if_statement() {
         let c = gen_c("if x >= 5 {\n  print x\n}");
-        assert!(c.contains("if (ks_truthy(ks_ge(x, ks_num(5.0))))"));
+        assert!(c.contains("if (ks_truthy(ks_ge(ksv_x, ks_num(5.0))))"));
+    }
+
+    #[test]
+    fn test_c_checked_generation_rejects_unimplemented_constructs() {
+        let mut lexer = Lexer::new("for x in range(3) { print x }");
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+        assert!(generate(&program).unwrap_err().contains("does not support for loops"));
+        assert!(generate_checked(&program).unwrap_err().contains("does not support for loops"));
     }
 
     #[test]

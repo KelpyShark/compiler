@@ -187,6 +187,10 @@ impl Parser {
                     self.advance();
                     params.push(name);
                 }
+                TokenKind::Self_ => {
+                    self.advance();
+                    params.push("self".to_string());
+                }
                 _ => return Err(self.error("Expected parameter name")),
             }
 
@@ -202,6 +206,17 @@ impl Parser {
 
     fn parse_block(&mut self) -> KelpyResult<Vec<Statement>> {
         self.skip_newlines();
+        match self.peek() {
+            TokenKind::LBrace => self.parse_braced_block(),
+            TokenKind::Colon => {
+                self.advance();
+                self.parse_end_block()
+            }
+            _ => Err(self.error("Expected '{' or ':' to start a block")),
+        }
+    }
+
+    fn parse_braced_block(&mut self) -> KelpyResult<Vec<Statement>> {
         self.expect(&TokenKind::LBrace)?;
         self.skip_newlines();
 
@@ -216,11 +231,76 @@ impl Parser {
         Ok(stmts)
     }
 
+    fn parse_end_block(&mut self) -> KelpyResult<Vec<Statement>> {
+        let stmts = self.parse_statements_until(&[TokenKind::End])?;
+        self.expect(&TokenKind::End)?;
+        Ok(stmts)
+    }
+
+    fn parse_statements_until(&mut self, terminators: &[TokenKind]) -> KelpyResult<Vec<Statement>> {
+        self.skip_newlines();
+        let mut stmts = Vec::new();
+        while !self.is_at_end() && !terminators.contains(self.peek()) {
+            stmts.push(self.parse_statement()?);
+            self.skip_newlines();
+        }
+        Ok(stmts)
+    }
+
     fn parse_if(&mut self) -> KelpyResult<Statement> {
         let location = self.current_location();
         self.advance(); // consume `if` or `elif`
 
         let condition = self.parse_expression(Precedence::None)?;
+
+        if matches!(self.peek(), TokenKind::Colon) {
+            self.advance();
+            let then_body = self.parse_statements_until(&[
+                TokenKind::Elif,
+                TokenKind::Else,
+                TokenKind::End,
+            ])?;
+
+            let mut elif_branches = Vec::new();
+            while matches!(self.peek(), TokenKind::Elif) {
+                let elif_location = self.current_location();
+                self.advance();
+                let elif_condition = self.parse_expression(Precedence::None)?;
+                self.expect(&TokenKind::Colon)?;
+                let elif_body = self.parse_statements_until(&[
+                    TokenKind::Elif,
+                    TokenKind::Else,
+                    TokenKind::End,
+                ])?;
+                elif_branches.push((elif_condition, elif_body, elif_location));
+            }
+
+            let mut else_body = if matches!(self.peek(), TokenKind::Else) {
+                self.advance();
+                self.expect(&TokenKind::Colon)?;
+                Some(self.parse_statements_until(&[TokenKind::End])?)
+            } else {
+                None
+            };
+            self.expect(&TokenKind::End)?;
+
+            for (elif_condition, elif_body, elif_location) in elif_branches.into_iter().rev() {
+                else_body = Some(vec![Statement::If {
+                    condition: elif_condition,
+                    then_body: elif_body,
+                    else_body,
+                    location: elif_location,
+                }]);
+            }
+
+            return Ok(Statement::If {
+                condition,
+                then_body,
+                else_body,
+                location,
+            });
+        }
+
         let then_body = self.parse_block()?;
 
         self.skip_newlines();
@@ -291,8 +371,16 @@ impl Parser {
         let location = self.current_location();
         self.advance(); // consume `return`
 
-        let value = if matches!(self.peek(), TokenKind::Newline | TokenKind::RBrace | TokenKind::Eof)
-        {
+        let value = if matches!(
+            self.peek(),
+            TokenKind::Newline
+                | TokenKind::RBrace
+                | TokenKind::End
+                | TokenKind::Else
+                | TokenKind::Elif
+                | TokenKind::Catch
+                | TokenKind::Eof
+        ) {
             None
         } else {
             Some(self.parse_expression(Precedence::None)?)
@@ -341,7 +429,13 @@ impl Parser {
     fn parse_try_catch(&mut self) -> KelpyResult<Statement> {
         let location = self.current_location();
         self.advance(); // consume `try`
-        let try_body = self.parse_block()?;
+        let colon_delimited = matches!(self.peek(), TokenKind::Colon);
+        let try_body = if colon_delimited {
+            self.advance();
+            self.parse_statements_until(&[TokenKind::Catch])?
+        } else {
+            self.parse_block()?
+        };
         self.skip_newlines();
         self.expect(&TokenKind::Catch)?;
         self.expect(&TokenKind::LParen)?;
@@ -353,7 +447,14 @@ impl Parser {
             _ => return Err(self.error("Expected variable name in catch()")),
         };
         self.expect(&TokenKind::RParen)?;
-        let catch_body = self.parse_block()?;
+        let catch_body = if colon_delimited {
+            self.expect(&TokenKind::Colon)?;
+            let body = self.parse_statements_until(&[TokenKind::End])?;
+            self.expect(&TokenKind::End)?;
+            body
+        } else {
+            self.parse_block()?
+        };
         Ok(Statement::TryCatch {
             try_body,
             catch_var,
@@ -380,15 +481,25 @@ impl Parser {
             _ => return Err(self.error("Expected class name after 'class'")),
         };
         self.skip_newlines();
-        self.expect(&TokenKind::LBrace)?;
+        let colon_delimited = matches!(self.peek(), TokenKind::Colon);
+        if colon_delimited {
+            self.advance();
+        } else {
+            self.expect(&TokenKind::LBrace)?;
+        }
         self.skip_newlines();
         let mut methods = Vec::new();
-        while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+        let close = if colon_delimited {
+            TokenKind::End
+        } else {
+            TokenKind::RBrace
+        };
+        while self.peek() != &close && !self.is_at_end() {
             let method = self.parse_function_def()?;
             methods.push(method);
             self.skip_newlines();
         }
-        self.expect(&TokenKind::RBrace)?;
+        self.expect(&close)?;
         Ok(Statement::ClassDef {
             name,
             methods,
@@ -403,19 +514,30 @@ impl Parser {
         // Check if this is an assignment: `name = expr`
         if matches!(self.peek(), TokenKind::Equals) {
             self.advance(); // consume `=`
-            if let Expr::Identifier { name, .. } = expr {
-                let value = self.parse_expression(Precedence::None)?;
-                return Ok(Statement::Assignment {
+            let value = self.parse_expression(Precedence::None)?;
+            return match expr {
+                Expr::Identifier { name, .. } => Ok(Statement::Assignment {
                     name,
                     value,
                     location,
-                });
-            } else {
-                return Err(KelpyError::ParseError {
+                }),
+                Expr::MemberAccess { object, member, .. } => Ok(Statement::MemberAssignment {
+                    object: *object,
+                    member,
+                    value,
+                    location,
+                }),
+                Expr::Index { object, index, .. } => Ok(Statement::IndexAssignment {
+                    object: *object,
+                    index: *index,
+                    value,
+                    location,
+                }),
+                _ => Err(KelpyError::ParseError {
                     message: "Invalid assignment target".to_string(),
                     location,
-                });
-            }
+                }),
+            };
         }
 
         // Compound assignment: `name += expr`, etc.
@@ -983,6 +1105,49 @@ mod tests {
     }
 
     #[test]
+    fn test_colon_end_blocks_are_indentation_independent_and_nest_correctly() {
+        let source = "if true:\nprint 1\nif false:\nprint 2\nend\nelif false:\nprint 3\nelse:\nprint 4\nend";
+        let program = parse(source).unwrap();
+        match &program.statements[0] {
+            Statement::If {
+                then_body,
+                else_body: Some(elif_branch),
+                ..
+            } => {
+                assert_eq!(then_body.len(), 2);
+                match &elif_branch[0] {
+                    Statement::If {
+                        then_body,
+                        else_body: Some(else_body),
+                        ..
+                    } => {
+                        assert_eq!(then_body.len(), 1);
+                        assert_eq!(else_body.len(), 1);
+                    }
+                    other => panic!("Expected lowered elif branch, got: {:?}", other),
+                }
+            }
+            other => panic!("Expected if statement, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_colon_end_blocks_for_functions_loops_classes_and_try_catch() {
+        let source = "def count(n):\nfor i in range(n):\nprint i\nend\nend\nclass Counter:\ndef value(self):\nreturn 1\nend\nend\ntry:\nthrow \"bad\"\ncatch (err):\nprint err\nend";
+        let program = parse(source).unwrap();
+        assert_eq!(program.statements.len(), 3);
+        assert!(matches!(program.statements[0], Statement::FunctionDef { .. }));
+        assert!(matches!(program.statements[1], Statement::ClassDef { .. }));
+        assert!(matches!(program.statements[2], Statement::TryCatch { .. }));
+    }
+
+    #[test]
+    fn test_braced_blocks_remain_supported() {
+        let program = parse("if true { print 1 }").unwrap();
+        assert!(matches!(program.statements[0], Statement::If { .. }));
+    }
+
+    #[test]
     fn test_while_loop() {
         let program = parse("while x < 10 {\n  x = x + 1\n}").unwrap();
         match &program.statements[0] {
@@ -1056,6 +1221,13 @@ mod tests {
             },
             other => panic!("Expected Assignment, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_member_and_index_assignment_targets() {
+        let program = parse("self.name = name\ndata[\"key\"] = 42").unwrap();
+        assert!(matches!(program.statements[0], Statement::MemberAssignment { .. }));
+        assert!(matches!(program.statements[1], Statement::IndexAssignment { .. }));
     }
 
     #[test]

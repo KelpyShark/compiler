@@ -57,8 +57,12 @@ pub struct SemanticAnalyzer {
     scopes: Vec<HashMap<String, bool>>,
     /// Known function definitions: name → (param count, location).
     functions: HashMap<String, FunctionInfo>,
+    /// Known classes and their constructor arities (excluding implicit `self`).
+    classes: HashMap<String, Option<usize>>,
     /// Whether we're currently inside a function body.
     in_function: bool,
+    /// Nesting depth of loops in the current function.
+    loop_depth: usize,
     /// Collected diagnostics.
     diagnostics: Vec<Diagnostic>,
     /// Built-in names that are always defined.
@@ -68,13 +72,18 @@ pub struct SemanticAnalyzer {
 impl SemanticAnalyzer {
     pub fn new() -> Self {
         let mut builtins = HashSet::new();
-        for name in &["len", "type", "str", "num", "push", "print"] {
+        for name in &[
+            "len", "type", "str", "num", "int", "float", "push", "print", "range",
+            "input", "abs", "sqrt", "floor", "ceil", "round", "min", "max", "pow",
+        ] {
             builtins.insert(name.to_string());
         }
         SemanticAnalyzer {
             scopes: vec![HashMap::new()],
             functions: HashMap::new(),
+            classes: HashMap::new(),
             in_function: false,
+            loop_depth: 0,
             diagnostics: Vec::new(),
             builtins,
         }
@@ -84,29 +93,40 @@ impl SemanticAnalyzer {
     pub fn analyze(&mut self, program: &Program) -> Vec<Diagnostic> {
         // First pass: collect all top-level function declarations
         for stmt in &program.statements {
-            if let Statement::FunctionDef {
-                name,
-                params,
-                location,
-                ..
-            } = stmt
-            {
-                if self.functions.contains_key(name) {
-                    self.diagnostics.push(Diagnostic {
-                        severity: Severity::Error,
-                        message: format!("Function '{}' is already defined", name),
-                        location: Some(location.clone()),
-                    });
-                } else {
-                    self.functions.insert(
-                        name.clone(),
-                        FunctionInfo {
-                            arity: params.len(),
-                            location: location.clone(),
-                        },
-                    );
-                    self.define(name);
+            match stmt {
+                Statement::FunctionDef { name, params, location, .. } => {
+                    if self.functions.contains_key(name) {
+                        self.diagnostics.push(Diagnostic {
+                            severity: Severity::Error,
+                            message: format!("Function '{}' is already defined", name),
+                            location: Some(location.clone()),
+                        });
+                    } else {
+                        self.functions.insert(
+                            name.clone(),
+                            FunctionInfo { arity: params.len(), location: location.clone() },
+                        );
+                        self.define(name);
+                    }
                 }
+                Statement::ClassDef { name, methods, location } => {
+                    if self.classes.contains_key(name) {
+                        self.diagnostics.push(Diagnostic {
+                            severity: Severity::Error,
+                            message: format!("Class '{}' is already defined", name),
+                            location: Some(location.clone()),
+                        });
+                    } else {
+                        let constructor_arity = methods.iter().find_map(|method| match method {
+                            Statement::FunctionDef { name: method_name, params, .. }
+                                if method_name == "__init__" => Some(params.len().saturating_sub(1)),
+                            _ => None,
+                        });
+                        self.classes.insert(name.clone(), constructor_arity);
+                        self.define(name);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -196,6 +216,15 @@ impl SemanticAnalyzer {
                 self.analyze_expr(value);
                 self.define(name);
             }
+            Statement::MemberAssignment { object, value, .. } => {
+                self.analyze_expr(object);
+                self.analyze_expr(value);
+            }
+            Statement::IndexAssignment { object, index, value, .. } => {
+                self.analyze_expr(object);
+                self.analyze_expr(index);
+                self.analyze_expr(value);
+            }
             Statement::FunctionDef {
                 name,
                 params,
@@ -216,23 +245,7 @@ impl SemanticAnalyzer {
                     self.define(name);
                 }
 
-                self.push_scope();
-                let prev_in_func = self.in_function;
-                self.in_function = true;
-
-                // Define parameters in function scope
-                for param in params {
-                    self.define(param);
-                    // Mark params as used (they're inputs)
-                    self.mark_used(param);
-                }
-
-                for s in body {
-                    self.analyze_statement(s);
-                }
-
-                let _func_scope = self.pop_scope();
-                self.in_function = prev_in_func;
+                self.analyze_function_body(params, body);
             }
             Statement::If {
                 condition,
@@ -242,18 +255,14 @@ impl SemanticAnalyzer {
             } => {
                 self.analyze_expr(condition);
 
-                self.push_scope();
                 for s in then_body {
                     self.analyze_statement(s);
                 }
-                self.pop_scope();
 
                 if let Some(else_stmts) = else_body {
-                    self.push_scope();
                     for s in else_stmts {
                         self.analyze_statement(s);
                     }
-                    self.pop_scope();
                 }
             }
             Statement::While {
@@ -262,11 +271,11 @@ impl SemanticAnalyzer {
                 ..
             } => {
                 self.analyze_expr(condition);
-                self.push_scope();
+                self.loop_depth += 1;
                 for s in body {
                     self.analyze_statement(s);
                 }
-                self.pop_scope();
+                self.loop_depth -= 1;
             }
             Statement::For {
                 variable,
@@ -275,13 +284,13 @@ impl SemanticAnalyzer {
                 ..
             } => {
                 self.analyze_expr(iterable);
-                self.push_scope();
                 self.define(variable);
                 self.mark_used(variable); // loop var is implicitly used
+                self.loop_depth += 1;
                 for s in body {
                     self.analyze_statement(s);
                 }
-                self.pop_scope();
+                self.loop_depth -= 1;
             }
             Statement::Return { value, location } => {
                 if !self.in_function {
@@ -295,8 +304,11 @@ impl SemanticAnalyzer {
                     self.analyze_expr(expr);
                 }
             }
-            Statement::Import { .. } => {
-                // Imports are valid anywhere; we can't resolve modules at this stage.
+            Statement::Import { module, .. } => {
+                // Module availability is runtime-specific, but its binding is
+                // introduced here so member accesses can be checked normally.
+                self.define(module);
+                self.mark_used(module);
             }
             Statement::Print { value, .. } => {
                 self.analyze_expr(value);
@@ -305,21 +317,67 @@ impl SemanticAnalyzer {
                 self.analyze_expr(expr);
             }
             // New statement types — basic analysis (walk inner expressions)
-            Statement::CompoundAssignment { value, .. } => {
+            Statement::CompoundAssignment { name, value, location, .. } => {
+                if !self.is_defined(name) {
+                    self.diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        message: format!("Undefined variable '{}'", name),
+                        location: Some(location.clone()),
+                    });
+                } else {
+                    self.mark_used(name);
+                }
                 self.analyze_expr(value);
             }
-            Statement::Break { .. } | Statement::Continue { .. } => {}
+            Statement::Break { location } | Statement::Continue { location } => {
+                if self.loop_depth == 0 {
+                    let keyword = if matches!(stmt, Statement::Break { .. }) { "break" } else { "continue" };
+                    self.diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        message: format!("'{}' used outside of a loop", keyword),
+                        location: Some(location.clone()),
+                    });
+                }
+            }
             Statement::Throw { value, .. } => {
                 self.analyze_expr(value);
             }
-            Statement::TryCatch { try_body, catch_body, .. } => {
+            Statement::TryCatch { try_body, catch_var, catch_body, .. } => {
                 for s in try_body { self.analyze_statement(s); }
+                self.push_scope();
+                self.define(catch_var);
+                self.mark_used(catch_var);
                 for s in catch_body { self.analyze_statement(s); }
+                self.pop_scope();
             }
             Statement::ClassDef { methods, .. } => {
-                for m in methods { self.analyze_statement(m); }
+                for method in methods {
+                    if let Statement::FunctionDef { params, body, .. } = method {
+                        self.analyze_function_body(params, body);
+                    }
+                }
             }
         }
+    }
+
+    fn analyze_function_body(&mut self, params: &[String], body: &[Statement]) {
+        self.push_scope();
+        let previous_in_function = self.in_function;
+        let previous_loop_depth = self.loop_depth;
+        self.in_function = true;
+        self.loop_depth = 0;
+
+        for param in params {
+            self.define(param);
+            self.mark_used(param);
+        }
+        for statement in body {
+            self.analyze_statement(statement);
+        }
+
+        self.pop_scope();
+        self.in_function = previous_in_function;
+        self.loop_depth = previous_loop_depth;
     }
 
     // ── Expression analysis ──
@@ -422,7 +480,25 @@ impl SemanticAnalyzer {
                 for arg in args { self.analyze_expr(arg); }
             }
 
-            Expr::New { args, .. } => {
+            Expr::New { class_name, args, location } => {
+                match self.classes.get(class_name) {
+                    None => self.diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        message: format!("Undefined class '{}'", class_name),
+                        location: Some(location.clone()),
+                    }),
+                    Some(None) if !args.is_empty() => self.diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        message: format!("Class '{}' has no constructor accepting arguments", class_name),
+                        location: Some(location.clone()),
+                    }),
+                    Some(Some(arity)) if args.len() != *arity => self.diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        message: format!("Constructor for '{}' expects {} argument(s), but {} were given", class_name, arity, args.len()),
+                        location: Some(location.clone()),
+                    }),
+                    _ => {}
+                }
                 for arg in args { self.analyze_expr(arg); }
             }
         }
@@ -528,6 +604,28 @@ mod tests {
     fn test_builtin_functions_are_defined() {
         let errs = errors("x = len(\"hello\")\nprint x");
         assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn test_runtime_builtins_and_import_bindings_are_defined() {
+        let errs = errors("import math\nfor i in range(3):\n print math.sqrt(i)\nend");
+        assert!(errs.is_empty(), "Expected valid built-ins and modules, got: {:?}", errs);
+    }
+
+    #[test]
+    fn test_catch_variable_and_loop_control_are_scoped_correctly() {
+        assert!(errors("try:\n throw \"bad\"\ncatch (err):\n print err\nend").is_empty());
+        assert!(errors("break").iter().any(|d| d.message.contains("outside of a loop")));
+        assert!(errors("def invalid():\n break\nend").iter().any(|d| d.message.contains("outside of a loop")));
+        assert!(errors("for i in range(1):\n break\nend").is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_and_constructor_validation() {
+        assert!(errors("missing += 1").iter().any(|d| d.message.contains("Undefined variable 'missing'")));
+        assert!(errors("new Missing()").iter().any(|d| d.message.contains("Undefined class 'Missing'")));
+        assert!(errors("class Box:\n def __init__(self, value):\n  self.value = value\n end\nend\nnew Box(1)").is_empty());
+        assert!(errors("class Box:\nend\nnew Box(1)").iter().any(|d| d.message.contains("no constructor")));
     }
 
     #[test]
