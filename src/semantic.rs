@@ -109,7 +109,7 @@ impl SemanticAnalyzer {
                         self.define(name);
                     }
                 }
-                Statement::ClassDef { name, methods, location } => {
+                Statement::ClassDef { name, methods, location, .. } => {
                     if self.classes.contains_key(name) {
                         self.diagnostics.push(Diagnostic {
                             severity: Severity::Error,
@@ -351,9 +351,20 @@ impl SemanticAnalyzer {
                 self.pop_scope();
             }
             Statement::ClassDef { methods, .. } => {
+                let class_methods: Vec<String> = methods
+                    .iter()
+                    .filter_map(|method| match method {
+                        Statement::FunctionDef {
+                            name, modifiers, ..
+                        } if modifiers.iter().any(|modifier| modifier == "static") => {
+                            Some(name.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 for method in methods {
                     if let Statement::FunctionDef { params, body, .. } = method {
-                        self.analyze_function_body(params, body);
+                        self.analyze_function_body_with_names(params, body, &class_methods);
                     }
                 }
             }
@@ -361,6 +372,15 @@ impl SemanticAnalyzer {
     }
 
     fn analyze_function_body(&mut self, params: &[String], body: &[Statement]) {
+        self.analyze_function_body_with_names(params, body, &[]);
+    }
+
+    fn analyze_function_body_with_names(
+        &mut self,
+        params: &[String],
+        body: &[Statement],
+        visible_names: &[String],
+    ) {
         self.push_scope();
         let previous_in_function = self.in_function;
         let previous_loop_depth = self.loop_depth;
@@ -370,6 +390,10 @@ impl SemanticAnalyzer {
         for param in params {
             self.define(param);
             self.mark_used(param);
+        }
+        for name in visible_names {
+            self.define(name);
+            self.mark_used(name);
         }
         for statement in body {
             self.analyze_statement(statement);

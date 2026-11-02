@@ -19,11 +19,42 @@ pub fn generate(program: &Program) -> Result<String, String> {
 
 /// Generate Java without target validation. Prefer [`generate`] for user input.
 fn generate_unchecked(program: &Program) -> String {
-    let functions = program.statements.iter().filter_map(|statement| match statement {
-        Statement::FunctionDef { name, .. } => Some(name.clone()),
-        _ => None,
-    }).collect();
-    let mut gen = JavaGenerator::new(functions);
+    let mut functions = HashSet::new();
+    let mut static_class_methods = HashSet::new();
+    for statement in &program.statements {
+        match statement {
+            Statement::FunctionDef { name, .. } => {
+                functions.insert(name.clone());
+            }
+            Statement::ClassDef { name, methods, .. } => {
+                for method in methods {
+                    if let Statement::FunctionDef {
+                        name: method_name,
+                        modifiers,
+                        params,
+                        param_types,
+                        return_type,
+                        ..
+                    } = method
+                    {
+                        if modifiers.iter().any(|modifier| modifier == "static")
+                            && !is_java_entrypoint_method(
+                                method_name,
+                                params,
+                                param_types,
+                                modifiers,
+                                return_type.as_deref(),
+                            )
+                        {
+                            static_class_methods.insert(format!("{}.{}", name, method_name));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut gen = JavaGenerator::new(functions, static_class_methods);
     gen.emit_program(program);
     gen.output
 }
@@ -40,17 +71,19 @@ struct JavaGenerator {
     variable_aliases: Vec<(String, String)>,
     temp_counter: usize,
     user_functions: HashSet<String>,
+    static_class_methods: HashSet<String>,
     global_variables: HashSet<String>,
 }
 
 impl JavaGenerator {
-    fn new(user_functions: HashSet<String>) -> Self {
+    fn new(user_functions: HashSet<String>, static_class_methods: HashSet<String>) -> Self {
         JavaGenerator {
             output: String::new(),
             indent: 0,
             variable_aliases: Vec::new(),
             temp_counter: 0,
             user_functions,
+            static_class_methods,
             global_variables: HashSet::new(),
         }
     }
@@ -123,7 +156,17 @@ impl JavaGenerator {
         emit_variable_declarations(self, &program.statements, &HashSet::new(), &globals);
         for stmt in &program.statements {
             match stmt {
-                Statement::FunctionDef { .. } | Statement::ClassDef { .. } => continue,
+                Statement::FunctionDef { .. } => continue,
+                Statement::ClassDef { .. } => {
+                    if let Some((class_name, main_params)) = java_style_main(stmt) {
+                        let class_name = mangled_class_name(class_name);
+                        if main_params == 1 {
+                            self.line(&format!("{}.main(args);", class_name));
+                        } else {
+                            self.line(&format!("{}.main();", class_name));
+                        }
+                    }
+                }
                 _ => self.emit_statement(stmt),
             }
         }
@@ -423,13 +466,44 @@ impl JavaGenerator {
                 let variable = self.variable(name);
                 self.line(&format!("{} = {}({}, {});", variable, helper, variable, v));
             }
-            Statement::FunctionDef { name, params, body, .. } => {
+            Statement::FunctionDef {
+                name,
+                params,
+                body,
+                modifiers,
+                param_types,
+                return_type,
+                annotations,
+                ..
+            } => {
+                if is_java_entrypoint_method(name, params, param_types, modifiers, return_type.as_deref()) {
+                    emit_java_annotations(self, annotations);
+                    let method_modifiers = java_method_modifiers(modifiers);
+                    let signature = if params.len() == 1 {
+                        format!("{} void main(String[] {})", method_modifiers, self.variable(&params[0]))
+                    } else {
+                        format!("{} void main()", method_modifiers)
+                    };
+                    self.line(&format!("{} throws Exception {{", signature));
+                    self.indent += 1;
+                    let parameters = params.iter().cloned().collect();
+                    let globals = self.global_variables.clone();
+                    emit_variable_declarations(self, body, &parameters, &globals);
+                    for statement in body {
+                        self.emit_statement(statement);
+                    }
+                    self.indent -= 1;
+                    self.line("}");
+                    return;
+                }
+                emit_java_annotations(self, annotations);
                 let param_list = params
                     .iter()
                     .map(|p| format!("Object {}", self.variable(p)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                self.line(&format!("static Object ks_{}({}) throws Exception {{", name, param_list));
+                let method_modifiers = java_method_modifiers(modifiers);
+                self.line(&format!("{} Object ks_{}({}) throws Exception {{", method_modifiers, name, param_list));
                 self.indent += 1;
                 let parameters = params.iter().cloned().collect();
                 let globals = self.global_variables.clone();
@@ -532,12 +606,30 @@ impl JavaGenerator {
                 self.indent -= 1;
                 self.line("}");
             }
-            Statement::ClassDef { name, methods, .. } => {
-                self.line(&format!("static class {} {{", mangled_class_name(name)));
+            Statement::ClassDef {
+                name,
+                methods,
+                modifiers,
+                annotations,
+                java_style,
+                ..
+            } => {
+                emit_java_annotations(self, annotations);
+                let class_modifiers = java_class_modifiers(modifiers);
+                self.line(&format!("{} class {} {{", class_modifiers, mangled_class_name(name)));
                 self.indent += 1;
+                let previous_functions = self.user_functions.clone();
+                if *java_style {
+                    for method in methods {
+                        if let Statement::FunctionDef { name, .. } = method {
+                            self.user_functions.insert(name.clone());
+                        }
+                    }
+                }
                 for m in methods {
                     self.emit_statement(m);
                 }
+                self.user_functions = previous_functions;
                 self.indent -= 1;
                 self.line("}");
             }
@@ -620,10 +712,22 @@ impl JavaGenerator {
                 }
             }
             Expr::MethodCall { object, method, args, .. } => {
-                let obj = self.emit_expr(object);
                 let arg_strs: Vec<String> = args.iter().map(|a| self.emit_expr(a)).collect();
-                format!("((Object){}).getClass().getMethod(\"{}\").invoke({}, {})",
-                    obj, method, obj, arg_strs.join(", "))
+                if let Expr::Identifier { name: class_name, .. } = object.as_ref() {
+                    if self.static_class_methods.contains(&format!("{}.{}", class_name, method)) {
+                        return format!(
+                            "{}.ks_{}({})",
+                            mangled_class_name(class_name),
+                            method,
+                            arg_strs.join(", ")
+                        );
+                    }
+                }
+                let obj = self.emit_expr(object);
+                format!(
+                    "((Object){}).getClass().getMethod(\"{}\").invoke({}, {})",
+                    obj, method, obj, arg_strs.join(", ")
+                )
             }
             Expr::MemberAccess { object, member, .. } => {
                 let obj = self.emit_expr(object);
@@ -748,6 +852,90 @@ fn collect_global_variables(statements: &[Statement]) -> HashSet<String> {
 
 fn variable_name(name: &str) -> String { format!("ksv_{}", name) }
 fn mangled_class_name(name: &str) -> String { format!("Ksc_{}", name) }
+
+fn java_class_modifiers(modifiers: &[String]) -> String {
+    let mut emitted = Vec::new();
+    for modifier in ["public", "protected", "private", "abstract", "final", "strictfp"] {
+        if modifiers.iter().any(|source| source == modifier) {
+            emitted.push(modifier);
+        }
+    }
+    emitted.push("static");
+    emitted.join(" ")
+}
+
+fn java_method_modifiers(modifiers: &[String]) -> String {
+    let mut emitted = Vec::new();
+    for modifier in ["public", "protected", "private"] {
+        if modifiers.iter().any(|source| source == modifier) {
+            emitted.push(modifier);
+        }
+    }
+    emitted.push("static");
+    for modifier in ["final", "synchronized", "strictfp"] {
+        if modifiers.iter().any(|source| source == modifier) {
+            emitted.push(modifier);
+        }
+    }
+    emitted.join(" ")
+}
+
+fn java_style_main(statement: &Statement) -> Option<(&str, usize)> {
+    let Statement::ClassDef {
+        name,
+        methods,
+        java_style: true,
+        ..
+    } = statement
+    else {
+        return None;
+    };
+    methods.iter().find_map(|method| {
+        let Statement::FunctionDef {
+            name: method_name,
+            params,
+            param_types,
+            modifiers,
+            return_type,
+            ..
+        } = method
+        else {
+            return None;
+        };
+        is_java_entrypoint_method(
+            method_name,
+            params,
+            param_types,
+            modifiers,
+            return_type.as_deref(),
+        )
+        .then_some((name.as_str(), params.len()))
+    })
+}
+
+fn is_java_entrypoint_method(
+    name: &str,
+    params: &[String],
+    param_types: &[Option<String>],
+    modifiers: &[String],
+    return_type: Option<&str>,
+) -> bool {
+    name == "main"
+        && return_type == Some("void")
+        && modifiers.iter().any(|modifier| modifier == "static")
+        && (params.is_empty()
+            || (params.len() == 1
+                && param_types.first().and_then(Option::as_deref) == Some("String[]")))
+}
+
+fn emit_java_annotations(generator: &mut JavaGenerator, annotations: &[Annotation]) {
+    if annotations
+        .iter()
+        .any(|annotation| annotation.name.rsplit('.').next() == Some("Deprecated"))
+    {
+        generator.line("@Deprecated");
+    }
+}
 
 fn quote_java_string(value: &str) -> String {
     let mut result = String::from("\"");
@@ -915,5 +1103,75 @@ mod tests {
         let program = Parser::new(lexer.tokenize().unwrap()).parse().unwrap();
         assert!(generate(&program).unwrap_err().contains("class definitions"));
         assert!(generate_checked(&program).unwrap_err().contains("class definitions"));
+    }
+
+    #[test]
+    fn java_style_class_generates_nested_static_methods_and_entrypoint() {
+        let source = r#"
+@Deprecated
+public class Main {
+    @Deprecated
+    public static int addNumbers(int num1, int num2) {
+        int sum = num1 + num2;
+        return sum;
+    }
+
+    public static void main(String[] args) {
+        int result = addNumbers(5, 10);
+        System.out.println("The sum is: " + result);
+    }
+}
+
+print Main.addNumbers(2, 3)
+"#;
+        let program = Parser::new(Lexer::new(source).tokenize().unwrap())
+            .parse()
+            .unwrap();
+        let java = generate(&program).expect("Java-style static class should be supported");
+        assert!(java.contains("@Deprecated\n    public static class Ksc_Main"));
+        assert!(java.contains("@Deprecated\n        public static Object ks_addNumbers"));
+        assert!(java.contains("public static void main(String[] ksv_args) throws Exception"));
+        assert!(java.contains("Ksc_Main.main(args);"));
+        assert!(java.contains("ks_addNumbers((double)5, (double)10)"));
+        let main_call = java.rfind("Ksc_Main.main(args);").unwrap();
+        let top_level_call = java
+            .rfind("ksPrint(Ksc_Main.ks_addNumbers((double)2, (double)3))")
+            .unwrap();
+        assert!(main_call < top_level_call, "class main should run at the class's source position");
+    }
+
+    #[test]
+    fn java_style_static_methods_can_be_called_through_the_class() {
+        let source = r#"
+public class Main {
+    public static int addNumbers(int num1, int num2) {
+        return num1 + num2;
+    }
+}
+
+print Main.addNumbers(2, 3)
+"#;
+        let program = Parser::new(Lexer::new(source).tokenize().unwrap())
+            .parse()
+            .unwrap();
+        let java = generate(&program).expect("qualified static call should be supported");
+        assert!(java.contains("ksPrint(Ksc_Main.ks_addNumbers((double)2, (double)3))"));
+    }
+
+    #[test]
+    fn non_entrypoint_method_named_main_is_not_rewritten_or_auto_called() {
+        let source = r#"
+public class Helper {
+    public static void main(int value) {
+        return;
+    }
+}
+"#;
+        let program = Parser::new(Lexer::new(source).tokenize().unwrap())
+            .parse()
+            .unwrap();
+        let java = generate(&program).expect("ordinary static main overload should generate");
+        assert!(java.contains("public static Object ks_main(Object ksv_value)"));
+        assert!(!java.contains("Ksc_Helper.main();"));
     }
 }

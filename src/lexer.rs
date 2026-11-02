@@ -73,6 +73,8 @@ pub enum TokenKind {
     Comma,    // ,
     Colon,    // :
     Dot,      // .
+    At,       // @
+    Semicolon, // ;
 
     // ── Special ──
     Newline,
@@ -136,6 +138,8 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Comma => write!(f, ","),
             TokenKind::Colon => write!(f, ":"),
             TokenKind::Dot => write!(f, "."),
+            TokenKind::At => write!(f, "@"),
+            TokenKind::Semicolon => write!(f, ";"),
             TokenKind::Newline => write!(f, "NEWLINE"),
             TokenKind::Eof => write!(f, "EOF"),
         }
@@ -490,7 +494,7 @@ impl Lexer {
             "class" => TokenKind::Class,
             "null" => TokenKind::Null,
             "new" => TokenKind::New,
-            "self" => TokenKind::Self_,
+            "self" | "this" => TokenKind::Self_,
             "end" => TokenKind::End,
             _ => TokenKind::Identifier(ident),
         };
@@ -550,6 +554,8 @@ impl Lexer {
             ',' => TokenKind::Comma,
             ':' => TokenKind::Colon,
             '.' => TokenKind::Dot,
+            '@' => TokenKind::At,
+            ';' => TokenKind::Semicolon,
             '=' => {
                 if self.peek() == Some('=') {
                     self.advance();
@@ -719,7 +725,7 @@ mod tests {
 
     #[test]
     fn test_punctuation() {
-        let kinds = token_kinds("( ) { } [ ] , : .");
+        let kinds = token_kinds("( ) { } [ ] , : . @ ;");
         assert_eq!(
             kinds,
             vec![
@@ -732,6 +738,8 @@ mod tests {
                 TokenKind::Comma,
                 TokenKind::Colon,
                 TokenKind::Dot,
+                TokenKind::At,
+                TokenKind::Semicolon,
                 TokenKind::Eof,
             ]
         );
@@ -858,7 +866,7 @@ mod tests {
 
     #[test]
     fn test_unexpected_character() {
-        let mut lexer = Lexer::new("x = @");
+        let mut lexer = Lexer::new("x = ?");
         let result = lexer.tokenize();
         assert!(result.is_err());
         match result.unwrap_err() {

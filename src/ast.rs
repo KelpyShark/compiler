@@ -10,12 +10,21 @@ pub struct Program {
     pub statements: Vec<Statement>,
 }
 
+/// Metadata written before a class or method declaration, such as
+/// `@Deprecated` or `@Override`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotation {
+    pub name: String,
+    pub arguments: Vec<String>,
+}
+
 /// A statement in the language.
 #[derive(Debug, Clone)]
 pub enum Statement {
     /// Variable assignment: `x = expr`
     Assignment {
         name: String,
+        declared_type: Option<String>,
         value: Expr,
         location: SourceLocation,
     },
@@ -44,6 +53,10 @@ pub enum Statement {
     FunctionDef {
         name: String,
         params: Vec<String>,
+        param_types: Vec<Option<String>>,
+        return_type: Option<String>,
+        modifiers: Vec<String>,
+        annotations: Vec<Annotation>,
         body: Vec<Statement>,
         location: SourceLocation,
     },
@@ -106,6 +119,9 @@ pub enum Statement {
     ClassDef {
         name: String,
         methods: Vec<Statement>,
+        modifiers: Vec<String>,
+        annotations: Vec<Annotation>,
+        java_style: bool,
         location: SourceLocation,
     },
     /// Expression used as a statement (e.g. a function call).

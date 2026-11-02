@@ -4,10 +4,38 @@ use std::collections::HashSet;
 /// Validate constructs whose current generated Java and C# runtimes can execute
 /// with the same behavior as the interpreter.
 pub fn validate_managed_target(program: &Program, target: &str) -> Result<(), String> {
-    let functions = program.statements.iter().filter_map(|statement| match statement {
-        Statement::FunctionDef { name, .. } => Some(name.clone()),
-        _ => None,
-    }).collect::<HashSet<_>>();
+    let mut functions = HashSet::new();
+    for statement in &program.statements {
+        match statement {
+            Statement::FunctionDef { name, .. } => { functions.insert(name.clone()); }
+            Statement::ClassDef { name: class_name, methods, .. } => {
+                for method in methods {
+                    if let Statement::FunctionDef {
+                        name,
+                        params,
+                        param_types,
+                        modifiers,
+                        return_type,
+                        ..
+                    } = method
+                    {
+                        functions.insert(name.clone());
+                        if modifiers.iter().any(|modifier| modifier == "static")
+                            && !(name == "main"
+                                && return_type.as_deref() == Some("void")
+                                && (params.is_empty()
+                                    || (params.len() == 1
+                                        && param_types.first().and_then(Option::as_deref)
+                                            == Some("String[]"))))
+                        {
+                            functions.insert(format!("{}.{}", class_name, name));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     for statement in &program.statements {
         validate_statement(statement, target, &functions, true)?;
     }
@@ -65,6 +93,9 @@ fn validate_javascript_statement(statement: &Statement, functions: &HashSet<Stri
             validate_javascript_statements(try_body, functions)?;
             validate_javascript_statements(catch_body, functions)
         }
+        Statement::ClassDef { java_style: true, .. } => Err(
+            "JavaScript target does not yet support Java-style class declarations".to_string(),
+        ),
         Statement::ClassDef { methods, .. } => {
             for method in methods { validate_javascript_statement(method, functions)?; }
             Ok(())
@@ -187,6 +218,54 @@ fn validate_statement(statement: &Statement, target: &str, functions: &HashSet<S
             validate_statements(try_body, target, functions)?;
             validate_statements(catch_body, target, functions)
         }
+        Statement::ClassDef { name: class_name, methods, modifiers, java_style, .. }
+            if target == "Java" && *java_style =>
+        {
+            validate_java_modifier_set(
+                modifiers,
+                &[
+                    "public",
+                    "protected",
+                    "private",
+                    "final",
+                    "abstract",
+                    "strictfp",
+                ],
+                &format!("class '{}'", class_name),
+            )?;
+            if modifiers.iter().any(|modifier| modifier == "final")
+                && modifiers.iter().any(|modifier| modifier == "abstract")
+            {
+                return Err(format!("Java class '{}' cannot be both final and abstract", class_name));
+            }
+            for method in methods {
+                match method {
+                    Statement::FunctionDef { modifiers, name: method_name, .. }
+                        if modifiers.iter().any(|modifier| modifier == "static") =>
+                    {
+                        validate_java_modifier_set(
+                            modifiers,
+                            &[
+                                "public",
+                                "protected",
+                                "private",
+                                "static",
+                                "final",
+                                "synchronized",
+                                "strictfp",
+                            ],
+                            &format!("method '{}.{}'", class_name, method_name),
+                        )?;
+                        validate_statement(method, target, functions, true)?;
+                    }
+                    Statement::FunctionDef { name, .. } => {
+                        return Err(format!("Java target does not yet support instance method '{}' in Java-style classes", name));
+                    }
+                    _ => return Err("Java target expects method declarations in classes".to_string()),
+                }
+            }
+            Ok(())
+        }
         Statement::ClassDef { .. } => Err(format!(
             "{} target does not yet support class definitions",
             target
@@ -194,6 +273,39 @@ fn validate_statement(statement: &Statement, target: &str, functions: &HashSet<S
         Statement::ExprStatement { expr, .. } => validate_expr(expr, target, functions),
         Statement::Break { .. } | Statement::Continue { .. } => Ok(()),
     }
+}
+
+fn validate_java_modifier_set(
+    modifiers: &[String],
+    allowed: &[&str],
+    declaration: &str,
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for modifier in modifiers {
+        if !allowed.contains(&modifier.as_str()) {
+            return Err(format!(
+                "Java target does not yet support modifier '{}' on {}",
+                modifier, declaration
+            ));
+        }
+        if !seen.insert(modifier) {
+            return Err(format!(
+                "Java declaration {} repeats modifier '{}'",
+                declaration, modifier
+            ));
+        }
+    }
+    let access_count = modifiers
+        .iter()
+        .filter(|modifier| ["public", "protected", "private"].contains(&modifier.as_str()))
+        .count();
+    if access_count > 1 {
+        return Err(format!(
+            "Java declaration {} has conflicting access modifiers",
+            declaration
+        ));
+    }
+    Ok(())
 }
 
 fn validate_statements(statements: &[Statement], target: &str, functions: &HashSet<String>) -> Result<(), String> {
@@ -260,6 +372,15 @@ fn validate_expr(expression: &Expr, target: &str, functions: &HashSet<String>) -
             }
             Ok(())
         }
+        Expr::MethodCall { object, method, args, .. }
+            if target == "Java"
+                && matches!(object.as_ref(), Expr::Identifier { name, .. } if functions.contains(&format!("{}.{}", name, method))) =>
+        {
+            for argument in args {
+                validate_expr(argument, target, functions)?;
+            }
+            Ok(())
+        }
         Expr::MethodCall { .. } => Err(format!("{} target does not yet support method calls", target)),
         Expr::New { .. } => Err(format!("{} target does not yet support object construction", target)),
         Expr::NumberLiteral { .. } | Expr::StringLiteral { .. } | Expr::BooleanLiteral { .. }
@@ -295,5 +416,15 @@ mod tests {
         assert!(validate("x = len()").unwrap_err().contains("expects 1 argument"));
         assert!(validate("x = range(1, 2, 3, 4)").unwrap_err().contains("range() expects"));
         assert!(validate("x = len([1])").is_ok());
+    }
+
+    #[test]
+    fn java_target_rejects_modifiers_it_cannot_preserve() {
+        let source = "public class Main { public static native int work() { return 1; } }";
+        let program = Parser::new(Lexer::new(source).tokenize().unwrap())
+            .parse()
+            .unwrap();
+        let error = validate_managed_target(&program, "Java").unwrap_err();
+        assert!(error.contains("does not yet support modifier 'native'"));
     }
 }

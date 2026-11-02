@@ -41,6 +41,33 @@ fn token_precedence(kind: &TokenKind) -> Precedence {
     }
 }
 
+fn is_java_modifier(name: &str) -> bool {
+    matches!(
+        name,
+        "public"
+            | "protected"
+            | "private"
+            | "static"
+            | "final"
+            | "abstract"
+            | "synchronized"
+            | "native"
+            | "strictfp"
+    )
+}
+
+fn annotation_token_text(token: &TokenKind) -> String {
+    match token {
+        TokenKind::Identifier(name) => name.clone(),
+        TokenKind::StringLiteral(value) => format!("{:?}", value),
+        TokenKind::NumberLiteral(value) => value.to_string(),
+        TokenKind::BooleanLiteral(value) => value.to_string(),
+        TokenKind::Class => "class".to_string(),
+        TokenKind::Newline => " ".to_string(),
+        _ => token.to_string(),
+    }
+}
+
 // ──────────────────────────────────────────────
 //  Parser
 // ──────────────────────────────────────────────
@@ -48,22 +75,27 @@ fn token_precedence(kind: &TokenKind) -> Precedence {
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    class_depth: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser {
+            tokens,
+            pos: 0,
+            class_depth: 0,
+        }
     }
 
     /// Parse the full token stream into a Program AST.
     pub fn parse(&mut self) -> KelpyResult<Program> {
         let mut statements = Vec::new();
-        self.skip_newlines();
+        self.skip_separators();
 
         while !self.is_at_end() {
             let stmt = self.parse_statement()?;
             statements.push(stmt);
-            self.skip_newlines();
+            self.skip_separators();
         }
 
         Ok(Program { statements })
@@ -103,6 +135,12 @@ impl Parser {
         }
     }
 
+    fn skip_separators(&mut self) {
+        while matches!(self.peek(), TokenKind::Newline | TokenKind::Semicolon) {
+            self.advance();
+        }
+    }
+
     fn expect(&mut self, expected: &TokenKind) -> KelpyResult<&Token> {
         if self.peek() == expected {
             Ok(self.advance())
@@ -125,6 +163,12 @@ impl Parser {
 
     fn parse_statement(&mut self) -> KelpyResult<Statement> {
         self.skip_newlines();
+        if matches!(self.peek(), TokenKind::At) {
+            return self.parse_annotated_declaration();
+        }
+        if matches!(self.peek(), TokenKind::Identifier(name) if is_java_modifier(name)) {
+            return self.parse_modified_declaration(Vec::new());
+        }
         match self.peek().clone() {
             TokenKind::Def => self.parse_function_def(),
             TokenKind::Class => self.parse_class_def(),
@@ -167,12 +211,278 @@ impl Parser {
         self.expect(&TokenKind::RParen)?;
         let body = self.parse_block()?;
 
+        let param_types = vec![None; params.len()];
         Ok(Statement::FunctionDef {
             name,
             params,
+            param_types,
+            return_type: None,
+            modifiers: Vec::new(),
+            annotations: Vec::new(),
             body,
             location,
         })
+    }
+
+    fn parse_annotated_declaration(&mut self) -> KelpyResult<Statement> {
+        let annotations = self.parse_annotations()?;
+        self.skip_newlines();
+        self.parse_modified_declaration(annotations)
+    }
+
+    fn parse_modified_declaration(
+        &mut self,
+        annotations: Vec<Annotation>,
+    ) -> KelpyResult<Statement> {
+        let modifiers = self.parse_modifiers();
+        match self.peek() {
+            TokenKind::Class => self.parse_java_class_def(modifiers, annotations),
+            TokenKind::Def => {
+                let mut function = self.parse_function_def()?;
+                if let Statement::FunctionDef {
+                    modifiers: target_modifiers,
+                    annotations: target_annotations,
+                    ..
+                } = &mut function
+                {
+                    *target_modifiers = modifiers;
+                    *target_annotations = annotations;
+                }
+                Ok(function)
+            }
+            TokenKind::Identifier(_) => {
+                self.parse_java_method_def(modifiers, annotations)
+            }
+            _ => Err(self.error(
+                "Expected a class or method declaration after annotations/modifiers",
+            )),
+        }
+    }
+
+    fn parse_modifiers(&mut self) -> Vec<String> {
+        let mut modifiers = Vec::new();
+        while let TokenKind::Identifier(name) = self.peek().clone() {
+            if !is_java_modifier(&name) {
+                break;
+            }
+            self.advance();
+            modifiers.push(name);
+        }
+        modifiers
+    }
+
+    fn parse_annotations(&mut self) -> KelpyResult<Vec<Annotation>> {
+        let mut annotations = Vec::new();
+        while matches!(self.peek(), TokenKind::At) {
+            self.advance();
+            let name = match self.peek().clone() {
+                TokenKind::Identifier(name) => {
+                    self.advance();
+                    name
+                }
+                _ => return Err(self.error("Expected annotation name after '@'")),
+            };
+            let mut qualified_name = name;
+            while matches!(self.peek(), TokenKind::Dot) {
+                self.advance();
+                match self.peek().clone() {
+                    TokenKind::Identifier(part) => {
+                        self.advance();
+                        qualified_name.push('.');
+                        qualified_name.push_str(&part);
+                    }
+                    _ => return Err(self.error("Expected annotation name after '.'")),
+                }
+            }
+
+            let mut arguments = Vec::new();
+            if matches!(self.peek(), TokenKind::LParen) {
+                self.advance();
+                let mut argument = String::new();
+                let mut nested_closers = Vec::new();
+                let mut closed = false;
+                while !self.is_at_end() {
+                    match self.peek().clone() {
+                        TokenKind::RParen if nested_closers.is_empty() => {
+                            self.advance();
+                            if !argument.is_empty() {
+                                arguments.push(argument);
+                            }
+                            closed = true;
+                            break;
+                        }
+                        TokenKind::LParen => {
+                            self.advance();
+                            nested_closers.push(TokenKind::RParen);
+                            argument.push('(');
+                        }
+                        TokenKind::LBracket => {
+                            self.advance();
+                            nested_closers.push(TokenKind::RBracket);
+                            argument.push('[');
+                        }
+                        TokenKind::LBrace => {
+                            self.advance();
+                            nested_closers.push(TokenKind::RBrace);
+                            argument.push('{');
+                        }
+                        TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                            let closing = self.peek().clone();
+                            if nested_closers.pop().as_ref() != Some(&closing) {
+                                return Err(self.error("Mismatched delimiter in annotation arguments"));
+                            }
+                            argument.push_str(&annotation_token_text(&self.advance().kind));
+                        }
+                        TokenKind::Comma if nested_closers.is_empty() => {
+                            self.advance();
+                            arguments.push(std::mem::take(&mut argument));
+                        }
+                        TokenKind::Newline if nested_closers.is_empty() => {
+                            return Err(self.error("Unterminated annotation arguments"));
+                        }
+                        _ => argument.push_str(&annotation_token_text(&self.advance().kind)),
+                    }
+                }
+                if !closed || !nested_closers.is_empty() {
+                    return Err(self.error("Unterminated annotation arguments"));
+                }
+            }
+            annotations.push(Annotation {
+                name: qualified_name,
+                arguments,
+            });
+            self.skip_newlines();
+        }
+        Ok(annotations)
+    }
+
+    fn parse_java_class_def(
+        &mut self,
+        modifiers: Vec<String>,
+        annotations: Vec<Annotation>,
+    ) -> KelpyResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenKind::Class)?;
+        let name = match self.peek().clone() {
+            TokenKind::Identifier(name) => {
+                self.advance();
+                name
+            }
+            _ => return Err(self.error("Expected class name after 'class'")),
+        };
+        self.parse_class_body(name, modifiers, annotations, true, location)
+    }
+
+    fn parse_java_method_def(
+        &mut self,
+        modifiers: Vec<String>,
+        annotations: Vec<Annotation>,
+    ) -> KelpyResult<Statement> {
+        if self.class_depth == 0 {
+            return Err(self.error("Java-style method declarations must be inside a class"));
+        }
+        let location = self.current_location();
+        let return_type = self.parse_java_type()?;
+        let name = match self.peek().clone() {
+            TokenKind::Identifier(name) => {
+                self.advance();
+                name
+            }
+            _ => return Err(self.error("Expected method name after return type")),
+        };
+        self.expect(&TokenKind::LParen)?;
+
+        let mut params = Vec::new();
+        let mut param_types = Vec::new();
+        if !matches!(self.peek(), TokenKind::RParen) {
+            loop {
+                self.skip_newlines();
+                let param_type = self.parse_java_type()?;
+                let param_name = match self.peek().clone() {
+                    TokenKind::Identifier(name) => {
+                        self.advance();
+                        name
+                    }
+                    _ => return Err(self.error("Expected parameter name after parameter type")),
+                };
+                param_types.push(Some(param_type));
+                params.push(param_name);
+                self.skip_newlines();
+                if matches!(self.peek(), TokenKind::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        if !modifiers.iter().any(|modifier| modifier == "static") {
+            params.insert(0, "self".to_string());
+            param_types.insert(0, None);
+        }
+        let body = self.parse_block()?;
+        Ok(Statement::FunctionDef {
+            name,
+            params,
+            param_types,
+            return_type: Some(return_type),
+            modifiers,
+            annotations,
+            body,
+            location,
+        })
+    }
+
+    fn parse_java_type(&mut self) -> KelpyResult<String> {
+        let mut type_name = match self.peek().clone() {
+            TokenKind::Identifier(name) => {
+                self.advance();
+                name
+            }
+            _ => return Err(self.error("Expected type name")),
+        };
+
+        while matches!(self.peek(), TokenKind::Dot) {
+            self.advance();
+            match self.peek().clone() {
+                TokenKind::Identifier(part) => {
+                    self.advance();
+                    type_name.push('.');
+                    type_name.push_str(&part);
+                }
+                _ => return Err(self.error("Expected type name after '.'")),
+            }
+        }
+
+        if matches!(self.peek(), TokenKind::LessThan) {
+            self.advance();
+            type_name.push('<');
+            loop {
+                if matches!(self.peek(), TokenKind::GreaterThan | TokenKind::Eof) {
+                    return Err(self.error("Expected a type argument before '>'"));
+                }
+                type_name.push_str(&self.parse_java_type()?);
+                if matches!(self.peek(), TokenKind::Comma) {
+                    self.advance();
+                    type_name.push(',');
+                } else if matches!(self.peek(), TokenKind::GreaterThan) {
+                    self.advance();
+                    type_name.push('>');
+                    break;
+                } else {
+                    return Err(self.error("Expected ',' or '>' in generic type"));
+                }
+            }
+        }
+
+        while matches!(self.peek(), TokenKind::LBracket)
+            && matches!(self.tokens.get(self.pos + 1).map(|token| &token.kind), Some(TokenKind::RBracket))
+        {
+            self.advance();
+            self.advance();
+            type_name.push_str("[]");
+        }
+        Ok(type_name)
     }
 
     fn parse_param_list(&mut self) -> KelpyResult<Vec<String>> {
@@ -218,13 +528,13 @@ impl Parser {
 
     fn parse_braced_block(&mut self) -> KelpyResult<Vec<Statement>> {
         self.expect(&TokenKind::LBrace)?;
-        self.skip_newlines();
+        self.skip_separators();
 
         let mut stmts = Vec::new();
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
             let stmt = self.parse_statement()?;
             stmts.push(stmt);
-            self.skip_newlines();
+            self.skip_separators();
         }
 
         self.expect(&TokenKind::RBrace)?;
@@ -238,11 +548,11 @@ impl Parser {
     }
 
     fn parse_statements_until(&mut self, terminators: &[TokenKind]) -> KelpyResult<Vec<Statement>> {
-        self.skip_newlines();
+        self.skip_separators();
         let mut stmts = Vec::new();
         while !self.is_at_end() && !terminators.contains(self.peek()) {
             stmts.push(self.parse_statement()?);
-            self.skip_newlines();
+            self.skip_separators();
         }
         Ok(stmts)
     }
@@ -375,6 +685,7 @@ impl Parser {
             self.peek(),
             TokenKind::Newline
                 | TokenKind::RBrace
+                | TokenKind::Semicolon
                 | TokenKind::End
                 | TokenKind::Else
                 | TokenKind::Elif
@@ -480,6 +791,17 @@ impl Parser {
             }
             _ => return Err(self.error("Expected class name after 'class'")),
         };
+        self.parse_class_body(name, Vec::new(), Vec::new(), false, location)
+    }
+
+    fn parse_class_body(
+        &mut self,
+        name: String,
+        modifiers: Vec<String>,
+        annotations: Vec<Annotation>,
+        java_style: bool,
+        location: SourceLocation,
+    ) -> KelpyResult<Statement> {
         self.skip_newlines();
         let colon_delimited = matches!(self.peek(), TokenKind::Colon);
         if colon_delimited {
@@ -487,28 +809,56 @@ impl Parser {
         } else {
             self.expect(&TokenKind::LBrace)?;
         }
-        self.skip_newlines();
+        self.skip_separators();
         let mut methods = Vec::new();
         let close = if colon_delimited {
             TokenKind::End
         } else {
             TokenKind::RBrace
         };
+        self.class_depth += 1;
         while self.peek() != &close && !self.is_at_end() {
-            let method = self.parse_function_def()?;
+            let method = self.parse_statement()?;
+            if !matches!(method, Statement::FunctionDef { .. }) {
+                return Err(self.error("Class bodies currently accept method declarations only"));
+            }
+            if let Statement::FunctionDef { name: method_name, .. } = &method {
+                let already_defined = methods.iter().any(|existing| {
+                    matches!(existing, Statement::FunctionDef { name, .. } if name == method_name)
+                });
+                if already_defined {
+                    return Err(self.error(format!(
+                        "Method '{}' is already defined in class '{}' (overloading is not supported)",
+                        method_name, name
+                    )));
+                }
+            }
             methods.push(method);
-            self.skip_newlines();
+            self.skip_separators();
         }
         self.expect(&close)?;
+        self.class_depth -= 1;
+        let java_style = java_style
+            || !modifiers.is_empty()
+            || !annotations.is_empty()
+            || methods.iter().any(|method| {
+                matches!(method, Statement::FunctionDef { return_type: Some(_), .. })
+            });
         Ok(Statement::ClassDef {
             name,
             methods,
+            modifiers,
+            annotations,
+            java_style,
             location,
         })
     }
 
     fn parse_assignment_or_expr(&mut self) -> KelpyResult<Statement> {
         let location = self.current_location();
+        if let Some(declaration) = self.try_parse_typed_assignment()? {
+            return Ok(declaration);
+        }
         let expr = self.parse_expression(Precedence::None)?;
 
         // Check if this is an assignment: `name = expr`
@@ -518,6 +868,7 @@ impl Parser {
             return match expr {
                 Expr::Identifier { name, .. } => Ok(Statement::Assignment {
                     name,
+                    declared_type: None,
                     value,
                     location,
                 }),
@@ -566,10 +917,72 @@ impl Parser {
             }
         }
 
-        Ok(Statement::ExprStatement {
-            expr,
-            location,
-        })
+        if let Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } = &expr
+        {
+            let is_system_out = matches!(
+                object.as_ref(),
+                Expr::MemberAccess { object, member, .. }
+                    if member == "out"
+                        && matches!(object.as_ref(), Expr::Identifier { name, .. } if name == "System")
+            );
+            if is_system_out && method == "println" {
+                return match args.as_slice() {
+                    [] => Ok(Statement::Print {
+                        value: Expr::StringLiteral {
+                            value: String::new(),
+                            location: location.clone(),
+                        },
+                        location,
+                    }),
+                    [value] => Ok(Statement::Print {
+                        value: value.clone(),
+                        location,
+                    }),
+                    _ => Err(KelpyError::ParseError {
+                        message: "System.out.println expects zero or one argument".to_string(),
+                        location,
+                    }),
+                };
+            }
+        }
+
+        Ok(Statement::ExprStatement { expr, location })
+    }
+
+    fn try_parse_typed_assignment(&mut self) -> KelpyResult<Option<Statement>> {
+        let start = self.pos;
+        let type_name = match self.parse_java_type() {
+            Ok(name) => name,
+            Err(_) => {
+                self.pos = start;
+                return Ok(None);
+            }
+        };
+        let name = match self.peek().clone() {
+            TokenKind::Identifier(name) => name,
+            _ => {
+                self.pos = start;
+                return Ok(None);
+            }
+        };
+        self.advance();
+        if !matches!(self.peek(), TokenKind::Equals) {
+            self.pos = start;
+            return Ok(None);
+        }
+        self.advance();
+        let value = self.parse_expression(Precedence::None)?;
+        Ok(Some(Statement::Assignment {
+            name,
+            declared_type: Some(type_name),
+            value,
+            location: self.tokens[start].location.clone(),
+        }))
     }
 
     // ── Expression parsing (Pratt) ──
@@ -1341,6 +1754,123 @@ example_function(42, "point")
         let program = program.unwrap();
         // Should have: bob assignment, example_list assignment, function def, function call
         assert_eq!(program.statements.len(), 4);
+    }
+
+    #[test]
+    fn parses_java_style_annotations_classes_methods_and_semicolons() {
+        let source = r#"
+@Deprecated(since = "2")
+public class Main {
+    @Override
+    public static int addNumbers(int num1, int num2) {
+        int sum = num1 + num2;
+        return sum;
+    }
+
+    public static void main(String[] args) {
+        int result = addNumbers(5, 10);
+        System.out.println("The sum is: " + result);
+    }
+}
+"#;
+        let program = parse(source).expect("Java-style class should parse");
+        let Statement::ClassDef {
+            annotations,
+            java_style,
+            methods,
+            ..
+        } = &program.statements[0]
+        else {
+            panic!("Expected class definition");
+        };
+        assert!(*java_style);
+        assert_eq!(annotations[0].name, "Deprecated");
+        assert_eq!(annotations[0].arguments, vec!["since=\"2\""]);
+
+        let Statement::FunctionDef {
+            name,
+            params,
+            param_types,
+            return_type,
+            modifiers,
+            annotations,
+            body,
+            ..
+        } = &methods[0]
+        else {
+            panic!("Expected annotated method");
+        };
+        assert_eq!(name, "addNumbers");
+        assert_eq!(params, &["num1", "num2"]);
+        assert_eq!(param_types, &[Some("int".to_string()), Some("int".to_string())]);
+        assert_eq!(return_type.as_deref(), Some("int"));
+        assert!(modifiers.contains(&"static".to_string()));
+        assert_eq!(annotations[0].name, "Override");
+        assert!(matches!(
+            &body[0],
+            Statement::Assignment {
+                declared_type: Some(type_name),
+                ..
+            } if type_name == "int"
+        ));
+
+        let Statement::FunctionDef { body, params, .. } = &methods[1] else {
+            panic!("Expected main method");
+        };
+        assert_eq!(params, &["args"]);
+        assert!(matches!(body[0], Statement::Assignment { .. }));
+        assert!(matches!(body[1], Statement::Print { .. }));
+    }
+
+    #[test]
+    fn parses_nested_generic_types_and_annotation_values() {
+        let source = r#"
+@Meta(tags = {"fast", "safe"}, type = String.class)
+public class Types {
+    public static java.util.Map<String, java.util.List<Integer>> copy(
+        java.util.Map<String, Integer> values
+    ) {
+        return values;
+    }
+}
+"#;
+        let program = parse(source).expect("nested generic declarations should parse");
+        let Statement::ClassDef { annotations, methods, .. } = &program.statements[0] else {
+            panic!("Expected class definition");
+        };
+        assert_eq!(annotations[0].arguments, vec!["tags={\"fast\",\"safe\"}", "type=String.class"]);
+        let Statement::FunctionDef { param_types, return_type, .. } = &methods[0] else {
+            panic!("Expected generic method definition");
+        };
+        assert_eq!(return_type.as_deref(), Some("java.util.Map<String,java.util.List<Integer>>"));
+        assert_eq!(param_types, &[Some("java.util.Map<String,Integer>".to_string())]);
+    }
+
+    #[test]
+    fn rejects_mismatched_annotation_argument_delimiters() {
+        let error = parse("@Meta(values = {1, 2])\nclass Types {}").unwrap_err();
+        assert!(error.to_string().contains("Mismatched delimiter in annotation arguments"));
+    }
+
+    #[test]
+    fn rejects_duplicate_class_methods_instead_of_silently_replacing_them() {
+        let source = "class Math { def add(self, n) {} def add(self, n, m) {} }";
+        let error = parse(source).unwrap_err();
+        assert!(error.to_string().contains("overloading is not supported"));
+    }
+
+    #[test]
+    fn supports_empty_java_println_and_rejects_unsupported_arity() {
+        let program = parse("System.out.println();").unwrap();
+        assert!(matches!(
+            &program.statements[0],
+            Statement::Print {
+                value: Expr::StringLiteral { value, .. },
+                ..
+            } if value.is_empty()
+        ));
+        let error = parse("System.out.println(1, 2);").unwrap_err();
+        assert!(error.to_string().contains("expects zero or one argument"));
     }
 }
 
